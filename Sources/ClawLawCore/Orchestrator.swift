@@ -46,6 +46,14 @@ public actor GovernanceOrchestrator {
             return .rejected(reason: reason)
             
         case .requireApproval(let level, let reason):
+            // Log the suspension to audit trail
+            await steward.logSuspension(
+                action: action,
+                level: level,
+                reason: reason,
+                agentId: agentId
+            )
+            
             let approvalId = await steward.submitForApproval(
                 action: action,
                 level: level,

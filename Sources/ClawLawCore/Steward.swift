@@ -76,6 +76,25 @@ public actor Steward {
     
     // MARK: - Approval Queue Management
     
+    /// Log a suspension to the audit trail
+    public func logSuspension(
+        action: AgentAction,
+        level: AuthorizationLevel,
+        reason: String,
+        agentId: String?
+    ) {
+        let entry = AuditEntry(
+            timestamp: Date(),
+            action: "SUSPENDED: \(action) (Level: \(level))",
+            effect: "Reason: \(reason)",
+            priorSpend: state.budget.currentSpend,
+            newSpend: state.budget.currentSpend,  // No spend change on suspension
+            enforcement: state.budget.enforcement,
+            agentId: agentId
+        )
+        state.auditLog.append(entry)
+    }
+    
     /// Submit an action for approval (called by orchestrator)
     public func submitForApproval(
         action: AgentAction,

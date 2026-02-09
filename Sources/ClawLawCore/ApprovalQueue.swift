@@ -43,8 +43,17 @@ public actor ApprovalQueue {
     }
     
     public enum Resolution: Equatable {
-        case approved
-        case rejected(String)
+        case approved(Date)
+        case rejected(String, Date)
+        
+        public var timestamp: Date {
+            switch self {
+            case .approved(let date):
+                return date
+            case .rejected(_, let date):
+                return date
+            }
+        }
     }
     
     // MARK: - State
@@ -92,14 +101,14 @@ public actor ApprovalQueue {
         }
         let action = pending[index].action
         pending.remove(at: index)
-        resolved[id] = .approved
+        resolved[id] = .approved(Date())
         return action
     }
     
     /// Reject an action with a reason
     public func reject(id: UUID, reason: String = "Denied by Steward") {
         pending.removeAll { $0.id == id }
-        resolved[id] = .rejected(reason)
+        resolved[id] = .rejected(reason, Date())
     }
     
     /// Check if an action has been resolved
@@ -114,8 +123,9 @@ public actor ApprovalQueue {
         let approved = pending.filter { $0.level < level }
         pending.removeAll { $0.level < level }
         
+        let timestamp = Date()
         for action in approved {
-            resolved[action.id] = .approved
+            resolved[action.id] = .approved(timestamp)
         }
         
         return approved.map { $0.action }
@@ -124,18 +134,8 @@ public actor ApprovalQueue {
     /// Clear resolved actions older than specified age
     public func clearResolved(olderThan age: TimeInterval) {
         let cutoff = Date().addingTimeInterval(-age)
-        // Keep only recent resolutions for debugging
-        resolved = resolved.filter { _, _ in
-            // Would need timestamp on Resolution to implement properly
-            // For now, just keep last 100
-            true
-        }
-        if resolved.count > 100 {
-            let sortedKeys = Array(resolved.keys.sorted())
-            let toRemove = sortedKeys.prefix(resolved.count - 100)
-            for key in toRemove {
-                resolved.removeValue(forKey: key)
-            }
+        resolved = resolved.filter { _, resolution in
+            resolution.timestamp >= cutoff
         }
     }
     

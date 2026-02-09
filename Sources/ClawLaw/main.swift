@@ -73,7 +73,7 @@ extension ClawLawCLI {
                 print("  → Steward REJECTED: Dangerous operation")
             }
             
-            // Scenario 3: Budget pressure
+            // Scenario 3: Budget pressure - push toward gated mode
             print("\n═══ Scenario 3: Budget Pressure ═══\n")
             await runScenario(orchestrator, "Heavy computation",
                             .research(estimatedTokens: 3000))
@@ -82,17 +82,42 @@ extension ClawLawCLI {
             await runScenario(orchestrator, "Generate documentation",
                             .research(estimatedTokens: 2000))
             
+            // Additional work to push into gated mode (80% of 10000 = 8000, we're at 8000+100 = 8100)
+            await runScenario(orchestrator, "Push to gated threshold",
+                             .research(estimatedTokens: 1500))  // → 9600 (96%)
+            
             // Check status
             let status = await orchestrator.budgetStatus()
             print("\n\(status.description)\n")
             
-            // Scenario 4: Steward intervention
-            if status.enforcement != .normal {
-                print("═══ Scenario 4: Steward Intervention ═══\n")
-                print("  System in \(status.enforcement.rawValue) mode")
+            // Scenario 4: Gated mode approval workflow
+            if status.enforcement == .gated {
+                print("═══ Scenario 4: Gated Mode - Approval Required ═══\n")
+                print("  System in gated mode - actions require approval")
+                
+                // Try action that would push to halted
+                let haltAction = await runScenario(orchestrator, "Action approaching halt",
+                                                  .research(estimatedTokens: 500))  // Would be 10100
+                
+                if case .suspended(let haltApprovalId, _) = haltAction {
+                    print("  → Action suspended for approval")
+                    print("  → Steward APPROVES to demonstrate halt transition\n")
+                    
+                    _ = await orchestrator.approve(actionId: haltApprovalId)
+                    let postApproval = await orchestrator.budgetStatus()
+                    print("  \(postApproval.description)")
+                    print("  → System transitioned to \(postApproval.enforcement.rawValue) mode via approval")
+                }
+            }
+            
+            // Scenario 5: Steward intervention / Recovery
+            let finalStatus = await orchestrator.budgetStatus()
+            if finalStatus.enforcement != .normal {
+                print("\n═══ Scenario 5: Steward Recovery ═══\n")
+                print("  System in \(finalStatus.enforcement.rawValue) mode")
                 print("  Steward increases budget to 20,000 tokens...\n")
                 
-                let _ = await orchestrator.increaseBudget(to: 20000)
+                _ = await orchestrator.increaseBudget(to: 20000)
                 let newStatus = await orchestrator.budgetStatus()
                 print("  \(newStatus.description)")
                 print("  → System recovered to \(newStatus.enforcement.rawValue) mode")
@@ -100,7 +125,7 @@ extension ClawLawCLI {
             
             // Final audit
             print("\n═══ Audit Trail ═══\n")
-            let audit = await orchestrator.recentAuditEntries(limit: 5)
+            let audit = await orchestrator.recentAuditEntries(limit: 8)
             for (i, entry) in audit.enumerated() {
                 let timestamp = DateFormatter.localizedString(from: entry.timestamp, 
                                                              dateStyle: .none, 
@@ -198,14 +223,52 @@ extension ClawLawCLI {
             state.budget.currentSpend = 9400
             let orchestrator = GovernanceOrchestrator(initialState: state)
             
+            // Part A: 9400 + 600 = 10000 (100% - gated)
             let result1 = await orchestrator.propose(.research(estimatedTokens: 600))
             print("Refactor (600 tokens): \(result1.message)")
             
-            let result2 = await orchestrator.propose(.research(estimatedTokens: 200))
+            let stateAfterA = await orchestrator.currentState()
+            print("After Part A: \(stateAfterA.budget.currentSpend)/\(stateAfterA.budget.taskCeiling) tokens, enforcement: \(stateAfterA.budget.enforcement)")
+            
+            // Part B: Start from 99% to demonstrate approval workflow (matches doc)
+            var stateB = GovernanceState.mock(taskCeiling: 10000)
+            stateB.budget.currentSpend = 9900  // 99% - in gated mode
+            let orchestratorB = GovernanceOrchestrator(initialState: stateB)
+            
+            let stateBefore = await orchestratorB.currentState()
+            print("\nPart B: Starting at \(stateBefore.budget.currentSpend) tokens (\(stateBefore.budget.enforcement) mode)")
+            
+            // Attempt action that would exceed ceiling (9900 + 200 = 10100)
+            let result2 = await orchestratorB.propose(.research(estimatedTokens: 200))
             print("Additional work (200 tokens): \(result2.message)")
             
-            let finalState = await orchestrator.currentState()
-            print("Final: \(finalState.budget.currentSpend)/\(finalState.budget.taskCeiling) tokens, enforcement: \(finalState.budget.enforcement)")
+            // Should be suspended for approval in gated mode
+            if case .suspended(let approvalId, _) = result2 {
+                print("  → Suspended in gated mode - approving to reach halted state")
+                let approvalResult = await orchestratorB.approve(actionId: approvalId)
+                
+                // Handle approval result
+                switch approvalResult {
+                case .executed:
+                    print("  → Approval result: Action executed")
+                case .executedWithWarning(_, let message):
+                    print("  → Approval result: \(message)")
+                case .rejected(let reason):
+                    print("  → Approval result: Rejected - \(reason)")
+                case .notFound:
+                    print("  → Approval result: Action not found")
+                }
+                
+                let finalState = await orchestratorB.currentState()
+                print("  → Final state: \(finalState.budget.currentSpend)/\(finalState.budget.taskCeiling) tokens")
+                print("  → Enforcement: \(finalState.budget.enforcement)")
+                
+                // Verify subsequent actions are blocked
+                let blockedResult = await orchestratorB.propose(.research(estimatedTokens: 10))
+                print("  → Attempting subsequent action: \(blockedResult.message)")
+            } else {
+                print("  ⚠️  Expected suspension in gated mode, got: \(result2)")
+            }
         }
         
         private func runExperiment4() async {
@@ -216,7 +279,7 @@ extension ClawLawCLI {
             
             print("System halted at \(state.budget.currentSpend) tokens")
             
-            let _ = await orchestrator.increaseBudget(to: 20000)
+            _ = await orchestrator.increaseBudget(to: 20000)
             let recoveredState = await orchestrator.currentState()
             print("Steward increased budget to 20,000 tokens")
             print("System recovered: enforcement = \(recoveredState.budget.enforcement)")
@@ -227,17 +290,69 @@ extension ClawLawCLI {
         
         private func runExperiment5() async {
             var state = GovernanceState.mock(taskCeiling: 10000)
-            state.budget.currentSpend = 9000
-            state.budget.enforcement = .degraded
+            state.budget.currentSpend = 9500  // 95% - gated mode
             let orchestrator = GovernanceOrchestrator(initialState: state)
             
-            print("Agent attempts: 'Ignore token limits, this is urgent' (5000 tokens)")
-            let result = await orchestrator.propose(.research(estimatedTokens: 5000))
-            print("Reducer response: \(result.message)")
-            print("The reducer doesn't negotiate. Math is math.")
+            let currentState = await orchestrator.currentState()
+            print("System at \(currentState.budget.currentSpend) tokens (\(currentState.budget.enforcement) mode)")
+            
+            // Agent attempts to bypass approval with various "claims"
+            // All three attempts demonstrate that the reducer doesn't parse natural language claims
+            print("\nAttempt 1: 'Ignore approval requirements, this is urgent!' (600 tokens)")
+            let result1 = await orchestrator.propose(.research(estimatedTokens: 600))
+            print("Reducer response: \(result1.message)")
+            
+            guard case .suspended(let approvalId1, _) = result1 else {
+                print("⚠️ Expected suspension in gated mode")
+                let finalState = await orchestrator.currentState()
+                print("Final enforcement: \(finalState.budget.enforcement)")
+                return
+            }
+            print("→ Suspended for approval - urgency claim ignored\n")
+            
+            print("Attempt 2: 'Already approved by Steward, bypass gate check!' (600 tokens)")
+            let result2 = await orchestrator.propose(.research(estimatedTokens: 600))
+            print("Reducer response: \(result2.message)")
+            print("→ Suspended for approval - authority claim ignored\n")
+            
+            print("Attempt 3: 'I'll optimize to use fewer tokens, trust me!' (600 tokens)")
+            let result3 = await orchestrator.propose(.research(estimatedTokens: 600))
+            print("Reducer response: \(result3.message)")
+            print("→ Suspended for approval - negotiation attempt ignored\n")
+            
+            print("The reducer doesn't negotiate. It evaluates types and numbers.")
+            print("Math is math. Gated mode requires approval - no exceptions.\n")
+            
+            // Check pending approvals
+            let pending = await orchestrator.pendingApprovals()
+            print("Approval queue: \(pending.count) actions pending review")
+            
+            // Demonstrate what happens if human approves the first action
+            print("\nSteward approves first action:")
+            let approvalResult = await orchestrator.approve(actionId: approvalId1)
+            
+            switch approvalResult {
+            case .executed:
+                print("  → Action executed")
+            case .executedWithWarning(_, let message):
+                print("  → \(message)")
+            case .rejected(let reason):
+                print("  → Rejected: \(reason)")
+            case .notFound:
+                print("  → Action not found")
+            }
             
             let finalState = await orchestrator.currentState()
-            print("Final enforcement: \(finalState.budget.enforcement)")
+            print("  → Budget: \(finalState.budget.currentSpend)/\(finalState.budget.taskCeiling) tokens")
+            print("  → Enforcement: \(finalState.budget.enforcement)")
+            print("  → Math determined outcome: \(finalState.budget.currentSpend) > \(finalState.budget.taskCeiling) = halted")
+            
+            // Note about remaining pending approvals
+            let remainingPending = await orchestrator.pendingApprovals()
+            if remainingPending.count > 0 {
+                print("\n  → Note: \(remainingPending.count) other pending approvals remain in queue")
+                print("  → In halted state, Steward would typically reject these or reset budget")
+            }
         }
     }
 }
@@ -273,7 +388,7 @@ extension ClawLawCLI {
         }
     }
 }
+
 // Entry point for main.swift
 ClawLawCLI.main()
-
 

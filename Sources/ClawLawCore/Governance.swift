@@ -93,12 +93,78 @@ public enum AgentAction: Equatable, Codable {
 
 public struct BudgetState: Equatable, Codable {
     public var taskCeiling: Int
-    public var currentSpend: Int
-    public var enforcement: EnforcementLevel
+    private var _currentSpend: Int
+    private var _enforcement: EnforcementLevel
     
     // Thresholds for state transitions (as percentages)
     public var warningThreshold: Double
     public var criticalThreshold: Double
+    
+    /// Public accessor for currentSpend - auto-reconciles enforcement when set
+    ///
+    /// **Enforcement Reconciliation Guarantee:**
+    /// When currentSpend is updated, enforcement is automatically reconciled to ensure
+    /// it cannot be less restrictive than what the spend percentage requires.
+    ///
+    /// Example:
+    /// ```swift
+    /// var budget = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .normal)
+    /// budget.currentSpend = 9500  // 95%
+    /// // enforcement automatically upgraded: .normal → .gated
+    /// ```
+    ///
+    /// **Order Independence:**
+    /// Due to computed property reconciliation, the order of property assignments
+    /// doesn't matter - the most restrictive enforcement level always wins:
+    ///
+    /// ```swift
+    /// // Pattern 1: Set spend first
+    /// budget.currentSpend = 9500  // → enforcement becomes .gated
+    /// budget.enforcement = .degraded  // → stays .gated (max(.degraded, .gated))
+    ///
+    /// // Pattern 2: Set enforcement first
+    /// budget.enforcement = .degraded  // → enforcement becomes .degraded
+    /// budget.currentSpend = 9500  // → enforcement becomes .gated (max(.degraded, .gated))
+    /// ```
+    ///
+    /// This design prevents bypassing gating through stale enforcement values,
+    /// even when directly manipulating struct properties for test setup.
+    public var currentSpend: Int {
+        get { _currentSpend }
+        set {
+            _currentSpend = newValue
+            // Auto-reconcile enforcement when spend changes
+            let calculated = calculatedEnforcementLevel
+            _enforcement = max(_enforcement, calculated)
+        }
+    }
+    
+    /// Public accessor for enforcement - prevents downgrading below calculated level
+    ///
+    /// **Enforcement Downgrade Protection:**
+    /// When enforcement is set directly, it is automatically reconciled against
+    /// the calculated level based on current spend. This prevents downgrading
+    /// enforcement below what the budget utilization requires.
+    ///
+    /// Example:
+    /// ```swift
+    /// var budget = BudgetState(taskCeiling: 10000, currentSpend: 9500)
+    /// // currentSpend = 9500 → calculated = .gated
+    /// budget.enforcement = .normal  // Attempt to downgrade
+    /// // Result: enforcement remains .gated (max(.normal, .gated))
+    /// ```
+    ///
+    /// This ensures that enforcement levels are **monotonic with respect to spend** -
+    /// you cannot have a less restrictive enforcement than your budget utilization requires.
+    public var enforcement: EnforcementLevel {
+        get { _enforcement }
+        set {
+            // Always use the MORE RESTRICTIVE of set value and calculated level
+            // This prevents bypassing gating by setting stale enforcement
+            let calculated = calculatedEnforcementLevel
+            _enforcement = max(newValue, calculated)
+        }
+    }
     
     public enum EnforcementLevel: String, Codable, Equatable, Comparable {
         case normal      // Full capability
@@ -117,6 +183,16 @@ public struct BudgetState: Equatable, Codable {
         }
     }
     
+    /// Computed property for enforcement level based on current spend
+    private var calculatedEnforcementLevel: EnforcementLevel {
+        Self.calculateEnforcementLevel(
+            spend: _currentSpend,
+            ceiling: taskCeiling,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
+    }
+    
     public init(
         taskCeiling: Int,
         currentSpend: Int = 0,
@@ -125,12 +201,14 @@ public struct BudgetState: Equatable, Codable {
         criticalThreshold: Double = 0.95
     ) {
         self.taskCeiling = taskCeiling
-        self.currentSpend = currentSpend
         self.warningThreshold = warningThreshold
         self.criticalThreshold = criticalThreshold
         
-        // Reconcile enforcement level with actual spend on initialization
-        // This prevents state/enforcement mismatches when loading from storage
+        // Initialize private properties
+        self._currentSpend = currentSpend
+        self._enforcement = enforcement
+        
+        // Reconcile enforcement level with actual spend after initialization
         let calculatedLevel = Self.calculateEnforcementLevel(
             spend: currentSpend,
             ceiling: taskCeiling,
@@ -139,8 +217,42 @@ public struct BudgetState: Equatable, Codable {
         )
         
         // Use the more restrictive of provided or calculated enforcement
-        // This prevents bypassing gating by providing stale enforcement level
-        self.enforcement = max(enforcement, calculatedLevel)
+        self._enforcement = max(enforcement, calculatedLevel)
+    }
+    
+    /// Reconcile enforcement after decoding (for Codable support)
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        
+        taskCeiling = try container.decode(Int.self, forKey: .taskCeiling)
+        warningThreshold = try container.decode(Double.self, forKey: .warningThreshold)
+        criticalThreshold = try container.decode(Double.self, forKey: .criticalThreshold)
+        
+        _currentSpend = try container.decode(Int.self, forKey: .currentSpend)
+        let decodedEnforcement = try container.decode(EnforcementLevel.self, forKey: .enforcement)
+        
+        // Reconcile after decoding
+        let calculated = Self.calculateEnforcementLevel(
+            spend: _currentSpend,
+            ceiling: taskCeiling,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
+        _enforcement = max(decodedEnforcement, calculated)
+    }
+    
+    /// Custom encoding (maps private properties to public coding keys)
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(taskCeiling, forKey: .taskCeiling)
+        try container.encode(_currentSpend, forKey: .currentSpend)
+        try container.encode(_enforcement, forKey: .enforcement)
+        try container.encode(warningThreshold, forKey: .warningThreshold)
+        try container.encode(criticalThreshold, forKey: .criticalThreshold)
+    }
+    
+    private enum CodingKeys: String, CodingKey {
+        case taskCeiling, currentSpend, enforcement, warningThreshold, criticalThreshold
     }
     
     private static func calculateEnforcementLevel(

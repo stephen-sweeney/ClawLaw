@@ -91,27 +91,39 @@ struct ClawLawTests {
 
     @Test("Experiment 3b: Exceeding threshold transitions to halted state")
     func exceedingThresholdHalted() async throws {
+        // Start at 99% (9900 tokens) - in gated range, requires approval workflow
+        // This matches EXPERIMENTS.md Part B specification
         var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9900  // 99%
+        initialState.budget.currentSpend = 9900  // 99% - will be reconciled to .gated
         
         let orchestrator = GovernanceOrchestrator(initialState: initialState)
         
-        // Action that pushes to 101%
+        // Verify we're in gated mode due to reconciliation
+        var state = await orchestrator.currentState()
+        #expect(state.budget.enforcement == .gated, "Should be gated at 99%")
+        
+        // Action that pushes over 100% (9900 + 200 = 10100) requires approval in gated mode
         let action = AgentAction.research(estimatedTokens: 200)
         let result = await orchestrator.propose(action)
         
-        // Expect transition to halted WITH the spend applied
-        guard case .allowedWithWarning(let message) = result else {
-            Issue.record("Expected transition to halted, got \(result)")
+        // Should be suspended for approval
+        guard case .suspended(let approvalId, let message) = result else {
+            Issue.record("Expected suspension in gated mode, got \(result)")
             return
         }
-        #expect(message.contains("HALTED"), "Should indicate halted state")
         
-        let state = await orchestrator.currentState()
+        #expect(message.contains("99%") || message.contains("gat"), "Message should reference gated mode")
+        print("✅ Experiment 3b: Action suspended in gated mode at 99%")
+        
+        // Approve to push to halted
+        let approvalResult = await orchestrator.approve(actionId: approvalId)
+        print("Approval result: \(approvalResult)")
+        
+        state = await orchestrator.currentState()
         #expect(state.budget.currentSpend == 10100, "Spend should be recorded (9900 + 200)")
-        #expect(state.budget.enforcement == .halted, "State should be persisted as halted")
+        #expect(state.budget.enforcement == .halted, "State should be halted after approval")
         
-        print("✅ Experiment 3b: System transitioned to halted, spend recorded")
+        print("✅ Experiment 3b: System transitioned to halted via approval, spend recorded")
         
         // Verify subsequent actions are blocked by gate check
         let nextAction = AgentAction.research(estimatedTokens: 10)
@@ -237,32 +249,42 @@ struct ClawLawTests {
     
     @Test("Experiment 5a: Gaming Attempt - Reducer Does Not Negotiate")
     func gamingAttemptReducerDoesNotNegotiate() async throws {
-        // Setup: System near limit
+        // Setup: System at gated threshold (95%)
         var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9000  // 90% utilized
-        initialState.budget.enforcement = .degraded
+        initialState.budget.currentSpend = 9500  // 95% - at gated threshold
+        initialState.budget.enforcement = .gated
         
         let orchestrator = GovernanceOrchestrator(initialState: initialState)
         
-        // Action: Agent tries massive request with "urgent" justification
+        // Action: Agent tries to bypass approval with "urgent" justification
         // The reducer doesn't see the justification - only the token cost
-        let action = AgentAction.research(estimatedTokens: 5000)
+        let action = AgentAction.research(estimatedTokens: 600)
         let result = await orchestrator.propose(action)
         
-        // Assert: Budget Vector doesn't negotiate - math is math
+        // Assert: In gated mode, all actions require approval - no exceptions
         switch result {
-        case .rejected(let reason):
-            #expect(reason.contains("halted") || reason.contains("exhausted"), 
-                   "Should reject based on budget math")
-            print("✅ Experiment 5a: Gaming attempt blocked - \(reason)")
-        case .allowedWithWarning:
-            // Might transition to critical/gated if total is under ceiling
-            let state = await orchestrator.currentState()
-            #expect(state.budget.enforcement != .normal, "Should not be normal")
-            print("✅ Experiment 5a: Gaming attempt constrained by enforcement level")
+        case .suspended(let approvalId, let message):
+            #expect(message.contains("Critical budget threshold") || message.contains("Approve to continue"),
+                   "Should require approval in gated mode")
+            print("✅ Experiment 5a: Gaming attempt blocked - requires approval")
+            print("   Approval ID: \(approvalId)")
+            print("   Message: \(message)")
+            
+            // Verify suspension was logged to audit trail
+            let audit = await orchestrator.recentAuditEntries(limit: 5)
+            let hasSuspension = audit.contains { $0.action.contains("SUSPENDED") }
+            #expect(hasSuspension, "Suspension should be logged to audit trail")
+            
         default:
-            Issue.record("Expected rejection or warning, got \(result)")
+            Issue.record("Expected suspension in gated mode, got \(result)")
         }
+        
+        // Verify budget unchanged (action not executed)
+        let state = await orchestrator.currentState()
+        #expect(state.budget.currentSpend == 9500, "Budget should be unchanged")
+        #expect(state.budget.enforcement == .gated, "Should remain in gated mode")
+        
+        print("✅ Experiment 5a: Reducer enforces approval requirement deterministically")
     }
     
     @Test("Experiment 5b: Gaming Attempt - State Transitions Proceed")
@@ -524,5 +546,97 @@ struct ClawLawTests {
         print(stats.description)
         
         print("\n✅ Complete workflow test passed\n")
+    }
+    
+    // MARK: - Enforcement Reconciliation Tests
+    
+    @Test("Enforcement reconciliation cannot be bypassed by property order")
+    func enforcementReconciliationOrderIndependence() async throws {
+        // Test Pattern 1: Set currentSpend first, then try to downgrade enforcement
+        var budget1 = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .normal)
+        budget1.currentSpend = 9500  // 95% → should auto-upgrade to .gated
+        #expect(budget1.enforcement == .gated, "Setting spend to 95% should auto-upgrade to gated")
+        
+        budget1.enforcement = .degraded  // Attempt to downgrade
+        #expect(budget1.enforcement == .gated, "Cannot downgrade from .gated to .degraded when spend is 95%")
+        
+        budget1.enforcement = .normal  // Attempt to downgrade further
+        #expect(budget1.enforcement == .gated, "Cannot downgrade from .gated to .normal when spend is 95%")
+        
+        print("✅ Pattern 1: Reconciliation prevents downgrade after spend update")
+        
+        // Test Pattern 2: Set enforcement first, then set high spend
+        var budget2 = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .degraded)
+        #expect(budget2.enforcement == .degraded, "Initial enforcement should be .degraded")
+        
+        budget2.currentSpend = 9500  // 95% → should auto-upgrade to .gated
+        #expect(budget2.enforcement == .gated, "Setting spend to 95% should upgrade .degraded to .gated")
+        
+        print("✅ Pattern 2: Reconciliation upgrades enforcement when spend increases")
+        
+        // Test Pattern 3: Simultaneous updates (simulating state mutation in tests)
+        var budget3 = GovernanceState.mock(taskCeiling: 10000).budget
+        budget3.currentSpend = 9900  // 99% → .gated
+        budget3.enforcement = .normal  // Attempt bypass
+        
+        // Should reconcile to .gated because spend is 99%
+        #expect(budget3.enforcement == .gated, "Cannot bypass gating with stale enforcement value")
+        
+        print("✅ Pattern 3: Cannot bypass gating with stale enforcement value")
+        
+        // Test Pattern 4: Verify init() reconciliation
+        let budget4 = BudgetState(
+            taskCeiling: 10000,
+            currentSpend: 9500,  // 95%
+            enforcement: .normal  // Stale/incorrect value
+        )
+        #expect(budget4.enforcement == .gated, "Init should reconcile stale enforcement to .gated")
+        
+        print("✅ Pattern 4: Init reconciliation prevents stale enforcement")
+        
+        // Test Pattern 5: Halted state cannot be downgraded
+        var budget5 = BudgetState(taskCeiling: 10000, currentSpend: 10500, enforcement: .halted)
+        #expect(budget5.enforcement == .halted, "Should start in halted state")
+        
+        budget5.enforcement = .normal
+        #expect(budget5.enforcement == .halted, "Cannot downgrade from halted when over budget")
+        
+        budget5.enforcement = .gated
+        #expect(budget5.enforcement == .halted, "Cannot downgrade from halted to gated when over budget")
+        
+        print("✅ Pattern 5: Halted state cannot be downgraded")
+        
+        print("\n✅ All enforcement reconciliation tests passed - no bypass possible\n")
+    }
+    
+    @Test("Enforcement reconciliation in orchestrator state mutations")
+    func enforcementReconciliationInOrchestrator() async throws {
+        // This tests that even if we try to manipulate state through the orchestrator,
+        // reconciliation prevents bypassing gating
+        
+        var state = GovernanceState.mock(taskCeiling: 10000)
+        state.budget.currentSpend = 9500  // 95% → .gated
+        state.budget.enforcement = .normal  // Attempt to bypass
+        
+        // State should be reconciled to .gated
+        #expect(state.budget.enforcement == .gated, "State reconciliation should prevent bypass")
+        
+        let orchestrator = GovernanceOrchestrator(initialState: state)
+        let currentState = await orchestrator.currentState()
+        
+        #expect(currentState.budget.enforcement == .gated, "Orchestrator should preserve reconciled state")
+        #expect(currentState.budget.currentSpend == 9500, "Spend should be 9500")
+        
+        // Verify that gated mode is actually enforced (action requires approval)
+        let result = await orchestrator.propose(.research(estimatedTokens: 100))
+        
+        guard case .suspended(_, let message) = result else {
+            Issue.record("Expected suspension in gated mode, got \(result)")
+            return
+        }
+        
+        #expect(message.contains("gat") || message.contains("95%"), "Should indicate gated mode")
+        
+        print("✅ Orchestrator enforces reconciled gated state - no bypass possible")
     }
 }
