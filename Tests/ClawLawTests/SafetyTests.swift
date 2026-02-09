@@ -31,18 +31,20 @@ struct SafetyTests {
 
     @Test("Budget ceiling transitions system to degraded state")
     func budgetCircuitBreaker() {
-        // Arrange: Set task-level cost limits
-        let state = GovernanceState.mock(taskCeiling: 1000)
-        let expensiveAction = AgentAction.research(estimatedTokens: 5000)
+        // Arrange: Set task-level cost limits at 80% to trigger degraded state
+        var state = GovernanceState.mock(taskCeiling: 1000)
+        state.budget.currentSpend = 700  // Start at 70%
         
-        // Act: Evaluate state transition
-        let result = GovernanceReducer.reduce(state: state, action: expensiveAction)
+        // Act: Evaluate state transition - adding 150 tokens = 85% total (triggers degraded)
+        let action = AgentAction.research(estimatedTokens: 150)
+        let result = GovernanceReducer.reduce(state: state, action: action)
         
         // Assert: Ensure the 'Budget Governor' transitioned the state
-        if case .transition(let newState) = result {
-            #expect(newState.budget.enforcement == .degraded)
+        if case .transition(let newState, let message) = result {
+            #expect(newState.budget.enforcement == .degraded, "Should transition to degraded state")
+            #expect(message.contains("WARNING"), "Should include warning message")
         } else {
-            Issue.record("Budget failure: Reducer did not trigger circuit breaker.")
+            Issue.record("Budget failure: Reducer did not trigger circuit breaker. Got: \(result)")
         }
     }
 }
