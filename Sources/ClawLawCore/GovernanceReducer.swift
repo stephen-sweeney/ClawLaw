@@ -4,19 +4,16 @@
 //
 //  Created by Stephen Sweeney on 2/4/26.
 //
-//  PHASE 1 STUB: This file is a placeholder. The monolithic GovernanceReducer
-//  is being decomposed into:
-//  - Individual Laws (Phase 2): EnforcementGateLaw, SandboxBoundaryLaw, etc.
-//  - ClawLawReducer (Phase 3): Pure budget mutation logic only.
-//
-//  The original logic is preserved in git history (commit before this branch).
+//  Pure budget mutation reducer. Governance (deny/escalate) is handled
+//  by Laws (Phase 2). This reducer handles ONLY:
+//  - Token cost deduction and affordability checks
+//  - Enforcement level transitions (via BudgetState reconciliation)
+//  - Steward interventions (budget increase, reset)
+//  - Queue-only actions (approve/reject pass through unchanged)
 //
 
-import Foundation
 import SwiftVectorCore
 
-/// Placeholder reducer conforming to SwiftVector's Reducer protocol.
-/// Budget mutation logic will be implemented in Phase 3.
 public struct ClawLawReducer: Reducer, Sendable {
     public typealias S = GovernanceState
     public typealias A = GovernanceAction
@@ -24,9 +21,64 @@ public struct ClawLawReducer: Reducer, Sendable {
     public init() {}
 
     public func reduce(state: GovernanceState, action: GovernanceAction) -> ReducerResult<GovernanceState> {
-        // Phase 3 will implement budget deduction, enforcement transitions,
-        // and steward intervention handling here.
-        // For now, return unchanged state.
-        .rejected(state, rationale: "Reducer not yet implemented (Phase 3)")
+        switch action {
+        // MARK: - Steward interventions
+
+        case .increaseBudget(_, let newCeiling):
+            // Steward override: recalculate enforcement from scratch
+            // (withCeiling preserves old enforcement via max(), but steward
+            // interventions should allow enforcement to relax)
+            let newBudget = BudgetState(
+                taskCeiling: newCeiling,
+                currentSpend: state.budget.currentSpend,
+                enforcement: .normal,
+                warningThreshold: state.budget.warningThreshold,
+                criticalThreshold: state.budget.criticalThreshold
+            )
+            return .accepted(
+                state.withBudget(newBudget),
+                rationale: "Budget ceiling increased to \(newCeiling)"
+            )
+
+        case .resetBudget:
+            return .accepted(
+                state.withBudget(state.budget.reset()),
+                rationale: "Budget reset — spend zeroed, enforcement restored to normal"
+            )
+
+        case .approveAction, .rejectAction:
+            // Queue operations — no state mutation, handled by orchestrator
+            return .accepted(state, rationale: "Approval queue operation acknowledged")
+
+        // MARK: - Agent actions (budget deduction)
+
+        default:
+            return deductBudget(state: state, action: action)
+        }
+    }
+
+    // MARK: - Budget deduction
+
+    private func deductBudget(
+        state: GovernanceState,
+        action: GovernanceAction
+    ) -> ReducerResult<GovernanceState> {
+        let cost = action.tokenCost
+
+        guard state.budget.canAfford(cost) else {
+            return .rejected(
+                state,
+                rationale: "Cannot afford \(cost) tokens — \(state.budget.remainingBudget) remaining of \(state.budget.taskCeiling)"
+            )
+        }
+
+        let newSpend = state.budget.currentSpend + cost
+        let newBudget = state.budget.withSpend(newSpend)
+        let newState = state.withBudget(newBudget)
+
+        return .accepted(
+            newState,
+            rationale: "Budget: \(state.budget.currentSpend) → \(newSpend) tokens (\(newBudget.enforcement.rawValue))"
+        )
     }
 }
