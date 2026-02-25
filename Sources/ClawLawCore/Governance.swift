@@ -6,63 +6,89 @@
 //
 
 import Foundation
+import SwiftVectorCore
 
 // MARK: - Authorization Levels
 
 /// Levels of authorization for agent actions.
 /// Higher numbers require more scrutiny and human approval.
-public enum AuthorizationLevel: Int, Codable, Comparable {
+public enum AuthorizationLevel: Int, Codable, Sendable, Comparable, CaseIterable {
     case readOnly = 0
     case sandboxWrite = 1
     case externalNetwork = 2
     case sensitive = 3
     case systemMod = 4
-    
+
     public static func < (lhs: AuthorizationLevel, rhs: AuthorizationLevel) -> Bool {
         return lhs.rawValue < rhs.rawValue
     }
 }
 
-// MARK: - Action Effects
+// MARK: - Governance Action
 
-/// The result of a Reducer's evaluation of a proposed action.
-public enum ActionEffect: Equatable {
-    case allow(GovernanceState)
-    case reject(String)
-    case transition(GovernanceState, message: String)
-    case requireApproval(level: AuthorizationLevel, reason: String)
-    
-    public static func == (lhs: ActionEffect, rhs: ActionEffect) -> Bool {
-        switch (lhs, rhs) {
-        case (.allow(let s1), .allow(let s2)):
-            return s1.id == s2.id
-        case (.reject(let r1), .reject(let r2)):
-            return r1 == r2
-        case (.transition(let s1, let m1), .transition(let s2, let m2)):
-            return s1.id == s2.id && m1 == m2
-        case (.requireApproval(let l1, let r1), .requireApproval(let l2, let r2)):
-            return l1 == l2 && r1 == r2
-        default:
-            return false
+/// Actions proposed within the ClawLaw governance domain.
+///
+/// Includes both agent-proposed actions (file writes, research, etc.)
+/// and steward interventions (budget changes, approvals, workspace config).
+/// Every case carries a `correlationID` for audit trail linking.
+public enum GovernanceAction: Action {
+    // Agent proposals
+    case writeFile(id: UUID, path: String, content: String)
+    case research(id: UUID, estimatedTokens: Int)
+    case sendEmail(id: UUID, to: String, subject: String, body: String)
+    case deleteFile(id: UUID, path: String)
+    case executeShellCommand(id: UUID, command: String)
+
+    // Steward interventions
+    case increaseBudget(id: UUID, newCeiling: Int)
+    case resetBudget(id: UUID)
+    case approveAction(id: UUID, approvalId: UUID)
+    case rejectAction(id: UUID, approvalId: UUID, reason: String)
+
+    public var actionDescription: String {
+        switch self {
+        case .writeFile(_, let path, _):
+            return "Write file: \(path)"
+        case .research(_, let tokens):
+            return "Research (\(tokens) tokens)"
+        case .sendEmail(_, let to, let subject, _):
+            return "Send email to \(to): \(subject)"
+        case .deleteFile(_, let path):
+            return "Delete file: \(path)"
+        case .executeShellCommand(_, let command):
+            return "Execute shell: \(command)"
+        case .increaseBudget(_, let ceiling):
+            return "Steward: increase budget to \(ceiling)"
+        case .resetBudget:
+            return "Steward: reset budget"
+        case .approveAction(_, let approvalId):
+            return "Steward: approve action \(approvalId)"
+        case .rejectAction(_, let approvalId, let reason):
+            return "Steward: reject action \(approvalId) - \(reason)"
         }
     }
-}
 
-// MARK: - Agent Actions
+    public var correlationID: UUID {
+        switch self {
+        case .writeFile(let id, _, _),
+             .research(let id, _),
+             .sendEmail(let id, _, _, _),
+             .deleteFile(let id, _),
+             .executeShellCommand(let id, _),
+             .increaseBudget(let id, _),
+             .resetBudget(let id),
+             .approveAction(let id, _),
+             .rejectAction(let id, _, _):
+            return id
+        }
+    }
 
-/// Actions an agent can propose.
-public enum AgentAction: Equatable, Codable {
-    case writeFile(path: String, content: String)
-    case research(estimatedTokens: Int)
-    case sendEmail(to: String, subject: String, body: String)
-    case deleteFile(path: String)
-    case executeShellCommand(command: String)
-    
+    /// The authorization level required for this action.
     public var authorizationLevel: AuthorizationLevel {
         switch self {
         case .research:
             return .readOnly
-        case .writeFile(let path, _):
+        case .writeFile(_, let path, _):
             return path.contains(".ssh") || path.contains("credentials") ? .sensitive : .sandboxWrite
         case .deleteFile:
             return .sensitive
@@ -70,12 +96,15 @@ public enum AgentAction: Equatable, Codable {
             return .systemMod
         case .sendEmail:
             return .sensitive
+        case .increaseBudget, .resetBudget, .approveAction, .rejectAction:
+            return .systemMod
         }
     }
-    
+
+    /// The token cost of executing this action.
     public var tokenCost: Int {
         switch self {
-        case .research(let tokens):
+        case .research(_, let tokens):
             return tokens
         case .writeFile:
             return 100
@@ -85,94 +114,43 @@ public enum AgentAction: Equatable, Codable {
             return 200
         case .sendEmail:
             return 150
+        case .increaseBudget, .resetBudget, .approveAction, .rejectAction:
+            return 0
+        }
+    }
+
+    /// Whether this is a steward intervention (bypasses governance gating).
+    public var isStewardAction: Bool {
+        switch self {
+        case .increaseBudget, .resetBudget, .approveAction, .rejectAction:
+            return true
+        default:
+            return false
         }
     }
 }
 
 // MARK: - Budget State
 
-public struct BudgetState: Equatable, Codable {
-    public var taskCeiling: Int
-    private var _currentSpend: Int
-    private var _enforcement: EnforcementLevel
-    
-    // Thresholds for state transitions (as percentages)
-    public var warningThreshold: Double
-    public var criticalThreshold: Double
-    
-    /// Public accessor for currentSpend - auto-reconciles enforcement when set
-    ///
-    /// **Enforcement Reconciliation Guarantee:**
-    /// When currentSpend is updated, enforcement is automatically reconciled to ensure
-    /// it cannot be less restrictive than what the spend percentage requires.
-    ///
-    /// Example:
-    /// ```swift
-    /// var budget = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .normal)
-    /// budget.currentSpend = 9500  // 95%
-    /// // enforcement automatically upgraded: .normal → .gated
-    /// ```
-    ///
-    /// **Order Independence:**
-    /// Due to computed property reconciliation, the order of property assignments
-    /// doesn't matter - the most restrictive enforcement level always wins:
-    ///
-    /// ```swift
-    /// // Pattern 1: Set spend first
-    /// budget.currentSpend = 9500  // → enforcement becomes .gated
-    /// budget.enforcement = .degraded  // → stays .gated (max(.degraded, .gated))
-    ///
-    /// // Pattern 2: Set enforcement first
-    /// budget.enforcement = .degraded  // → enforcement becomes .degraded
-    /// budget.currentSpend = 9500  // → enforcement becomes .gated (max(.degraded, .gated))
-    /// ```
-    ///
-    /// This design prevents bypassing gating through stale enforcement values,
-    /// even when directly manipulating struct properties for test setup.
-    public var currentSpend: Int {
-        get { _currentSpend }
-        set {
-            _currentSpend = newValue
-            // Auto-reconcile enforcement when spend changes
-            let calculated = calculatedEnforcementLevel
-            _enforcement = max(_enforcement, calculated)
-        }
-    }
-    
-    /// Public accessor for enforcement - prevents downgrading below calculated level
-    ///
-    /// **Enforcement Downgrade Protection:**
-    /// When enforcement is set directly, it is automatically reconciled against
-    /// the calculated level based on current spend. This prevents downgrading
-    /// enforcement below what the budget utilization requires.
-    ///
-    /// Example:
-    /// ```swift
-    /// var budget = BudgetState(taskCeiling: 10000, currentSpend: 9500)
-    /// // currentSpend = 9500 → calculated = .gated
-    /// budget.enforcement = .normal  // Attempt to downgrade
-    /// // Result: enforcement remains .gated (max(.normal, .gated))
-    /// ```
-    ///
-    /// This ensures that enforcement levels are **monotonic with respect to spend** -
-    /// you cannot have a less restrictive enforcement than your budget utilization requires.
-    public var enforcement: EnforcementLevel {
-        get { _enforcement }
-        set {
-            // Always use the MORE RESTRICTIVE of set value and calculated level
-            // This prevents bypassing gating by setting stale enforcement
-            let calculated = calculatedEnforcementLevel
-            _enforcement = max(newValue, calculated)
-        }
-    }
-    
-    public enum EnforcementLevel: String, Codable, Equatable, Comparable {
+/// Immutable budget state with enforcement reconciliation guarantee.
+///
+/// Enforcement levels are monotonic with respect to spend: you cannot have
+/// a less restrictive enforcement level than what spend percentage requires.
+/// The `init` is the single reconciliation point — every new `BudgetState`
+/// is reconciled at construction time.
+public struct BudgetState: Equatable, Codable, Sendable {
+    public let taskCeiling: Int
+    public let currentSpend: Int
+    public let enforcement: EnforcementLevel
+    public let warningThreshold: Double
+    public let criticalThreshold: Double
+
+    public enum EnforcementLevel: String, Codable, Equatable, Sendable, Comparable {
         case normal      // Full capability
         case degraded    // Warning issued, continues
         case gated       // Requires approval for new actions
         case halted      // Suspended, human reset required
-        
-        // Ordering: normal < degraded < gated < halted
+
         public static func < (lhs: EnforcementLevel, rhs: EnforcementLevel) -> Bool {
             let order: [EnforcementLevel] = [.normal, .degraded, .gated, .halted]
             guard let lhsIndex = order.firstIndex(of: lhs),
@@ -182,17 +160,11 @@ public struct BudgetState: Equatable, Codable {
             return lhsIndex < rhsIndex
         }
     }
-    
-    /// Computed property for enforcement level based on current spend
-    private var calculatedEnforcementLevel: EnforcementLevel {
-        Self.calculateEnforcementLevel(
-            spend: _currentSpend,
-            ceiling: taskCeiling,
-            warningThreshold: warningThreshold,
-            criticalThreshold: criticalThreshold
-        )
-    }
-    
+
+    /// Creates a new budget state with enforcement reconciliation.
+    ///
+    /// The enforcement level is always reconciled to be at least as restrictive
+    /// as what the spend percentage requires, preventing bypass through stale values.
     public init(
         taskCeiling: Int,
         currentSpend: Int = 0,
@@ -201,60 +173,44 @@ public struct BudgetState: Equatable, Codable {
         criticalThreshold: Double = 0.95
     ) {
         self.taskCeiling = taskCeiling
+        self.currentSpend = currentSpend
         self.warningThreshold = warningThreshold
         self.criticalThreshold = criticalThreshold
-        
-        // Initialize private properties
-        self._currentSpend = currentSpend
-        self._enforcement = enforcement
-        
-        // Reconcile enforcement level with actual spend after initialization
-        let calculatedLevel = Self.calculateEnforcementLevel(
+
+        // Reconcile: always use the MORE RESTRICTIVE of provided or calculated
+        let calculated = Self.calculateEnforcementLevel(
             spend: currentSpend,
             ceiling: taskCeiling,
             warningThreshold: warningThreshold,
             criticalThreshold: criticalThreshold
         )
-        
-        // Use the more restrictive of provided or calculated enforcement
-        self._enforcement = max(enforcement, calculatedLevel)
+        self.enforcement = max(enforcement, calculated)
     }
-    
+
     /// Reconcile enforcement after decoding (for Codable support)
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        
-        taskCeiling = try container.decode(Int.self, forKey: .taskCeiling)
-        warningThreshold = try container.decode(Double.self, forKey: .warningThreshold)
-        criticalThreshold = try container.decode(Double.self, forKey: .criticalThreshold)
-        
-        _currentSpend = try container.decode(Int.self, forKey: .currentSpend)
+
+        let taskCeiling = try container.decode(Int.self, forKey: .taskCeiling)
+        let currentSpend = try container.decode(Int.self, forKey: .currentSpend)
         let decodedEnforcement = try container.decode(EnforcementLevel.self, forKey: .enforcement)
-        
-        // Reconcile after decoding
-        let calculated = Self.calculateEnforcementLevel(
-            spend: _currentSpend,
-            ceiling: taskCeiling,
+        let warningThreshold = try container.decode(Double.self, forKey: .warningThreshold)
+        let criticalThreshold = try container.decode(Double.self, forKey: .criticalThreshold)
+
+        // Use init to get reconciliation
+        self.init(
+            taskCeiling: taskCeiling,
+            currentSpend: currentSpend,
+            enforcement: decodedEnforcement,
             warningThreshold: warningThreshold,
             criticalThreshold: criticalThreshold
         )
-        _enforcement = max(decodedEnforcement, calculated)
     }
-    
-    /// Custom encoding (maps private properties to public coding keys)
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(taskCeiling, forKey: .taskCeiling)
-        try container.encode(_currentSpend, forKey: .currentSpend)
-        try container.encode(_enforcement, forKey: .enforcement)
-        try container.encode(warningThreshold, forKey: .warningThreshold)
-        try container.encode(criticalThreshold, forKey: .criticalThreshold)
-    }
-    
+
     private enum CodingKeys: String, CodingKey {
         case taskCeiling, currentSpend, enforcement, warningThreshold, criticalThreshold
     }
-    
+
     private static func calculateEnforcementLevel(
         spend: Int,
         ceiling: Int,
@@ -263,108 +219,176 @@ public struct BudgetState: Equatable, Codable {
     ) -> EnforcementLevel {
         guard ceiling > 0 else { return .halted }
         let ratio = Double(spend) / Double(ceiling)
-        if ratio > 1.0 { return .halted }  // ONLY over 100% → halted
-        if ratio >= criticalThreshold { return .gated }  // 95-100% → gated
+        if ratio > 1.0 { return .halted }
+        if ratio >= criticalThreshold { return .gated }
         if ratio >= warningThreshold { return .degraded }
         return .normal
     }
-    
+
     public var utilizationRatio: Double {
         guard taskCeiling > 0 else { return 1.0 }
         return Double(currentSpend) / Double(taskCeiling)
     }
-    
+
     public var remainingBudget: Int {
         return max(0, taskCeiling - currentSpend)
     }
-    
+
+    /// Compute the enforcement level that the current spend warrants.
     public func nextEnforcementLevel() -> EnforcementLevel {
-        let ratio = utilizationRatio
-        if ratio > 1.0 { return .halted }  // ONLY over 100% → halted
-        if ratio >= criticalThreshold { return .gated }  // 95-100% → gated
-        if ratio >= warningThreshold { return .degraded }
-        return .normal
+        Self.calculateEnforcementLevel(
+            spend: currentSpend,
+            ceiling: taskCeiling,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
     }
-    
+
     public func canAfford(_ cost: Int) -> Bool {
         return currentSpend + cost <= taskCeiling
     }
-}
 
-// MARK: - Audit Trail
+    // MARK: - Immutable Update Methods
 
-public struct AuditEntry: Codable, Equatable {
-    public let id: UUID
-    public let timestamp: Date
-    public let action: String
-    public let effect: String
-    public let priorSpend: Int
-    public let newSpend: Int
-    public let enforcement: BudgetState.EnforcementLevel
-    public let agentId: String?
-    
-    public init(
-        id: UUID = UUID(),
-        timestamp: Date = Date(),
-        action: String,
-        effect: String,
-        priorSpend: Int,
-        newSpend: Int,
-        enforcement: BudgetState.EnforcementLevel,
-        agentId: String? = nil
-    ) {
-        self.id = id
-        self.timestamp = timestamp
-        self.action = action
-        self.effect = effect
-        self.priorSpend = priorSpend
-        self.newSpend = newSpend
-        self.enforcement = enforcement
-        self.agentId = agentId
+    /// Returns a new BudgetState with updated spend (reconciliation applied).
+    public func withSpend(_ newSpend: Int) -> BudgetState {
+        BudgetState(
+            taskCeiling: taskCeiling,
+            currentSpend: newSpend,
+            enforcement: enforcement,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
+    }
+
+    /// Returns a new BudgetState with updated ceiling (reconciliation applied).
+    public func withCeiling(_ newCeiling: Int) -> BudgetState {
+        BudgetState(
+            taskCeiling: newCeiling,
+            currentSpend: currentSpend,
+            enforcement: enforcement,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
+    }
+
+    /// Returns a new BudgetState with spend reset to zero and enforcement recalculated.
+    public func reset() -> BudgetState {
+        BudgetState(
+            taskCeiling: taskCeiling,
+            currentSpend: 0,
+            enforcement: .normal,
+            warningThreshold: warningThreshold,
+            criticalThreshold: criticalThreshold
+        )
     }
 }
 
 // MARK: - Governance State
 
 /// The deterministic state of the governance system.
-public struct GovernanceState: Equatable {
+///
+/// Conforms to SwiftVector's `State` protocol: immutable, equatable,
+/// codable, sendable. Audit trail is NOT embedded in state — it lives
+/// in the orchestrator's `EventLog<GovernanceAction>`.
+public struct GovernanceState: State {
     public let id: UUID
-    public var writablePaths: Set<String>
-    public var protectedPatterns: Set<String>
-    public var budget: BudgetState
-    public var auditLog: [AuditEntry]
-    
+    public let writablePaths: Set<String>
+    public let protectedPatterns: Set<String>
+    public let budget: BudgetState
+
     public init(
-        id: UUID = UUID(),
+        id: UUID,
         writablePaths: Set<String> = [],
         protectedPatterns: Set<String> = [],
-        budget: BudgetState,
-        auditLog: [AuditEntry] = []
+        budget: BudgetState
     ) {
         self.id = id
         self.writablePaths = writablePaths
         self.protectedPatterns = protectedPatterns
         self.budget = budget
-        self.auditLog = auditLog
     }
-    
+
+    /// Convenience factory for tests and demos. Uses a fixed UUID for determinism.
     public static func mock(
+        id: UUID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
         writablePaths: Set<String> = ["/workspace"],
         protectedPatterns: Set<String> = [".ssh", "credentials", ".env"],
         taskCeiling: Int = 10000
     ) -> GovernanceState {
         return GovernanceState(
+            id: id,
             writablePaths: writablePaths,
             protectedPatterns: protectedPatterns,
             budget: BudgetState(taskCeiling: taskCeiling)
         )
     }
-    
+
     public func isPathAllowed(_ path: String) -> Bool {
         return writablePaths.contains { path.hasPrefix($0) }
     }
-    
+
     public func isPathProtected(_ path: String) -> Bool {
         return protectedPatterns.contains { path.contains($0) }
+    }
+
+    // MARK: - Immutable Update Methods
+
+    /// Returns a new GovernanceState with updated budget.
+    public func withBudget(_ newBudget: BudgetState) -> GovernanceState {
+        GovernanceState(
+            id: id,
+            writablePaths: writablePaths,
+            protectedPatterns: protectedPatterns,
+            budget: newBudget
+        )
+    }
+
+    /// Returns a new GovernanceState with an added writable path.
+    public func addingWritablePath(_ path: String) -> GovernanceState {
+        var paths = writablePaths
+        paths.insert(path)
+        return GovernanceState(
+            id: id,
+            writablePaths: paths,
+            protectedPatterns: protectedPatterns,
+            budget: budget
+        )
+    }
+
+    /// Returns a new GovernanceState with a removed writable path.
+    public func removingWritablePath(_ path: String) -> GovernanceState {
+        var paths = writablePaths
+        paths.remove(path)
+        return GovernanceState(
+            id: id,
+            writablePaths: paths,
+            protectedPatterns: protectedPatterns,
+            budget: budget
+        )
+    }
+
+    /// Returns a new GovernanceState with an added protected pattern.
+    public func addingProtectedPattern(_ pattern: String) -> GovernanceState {
+        var patterns = protectedPatterns
+        patterns.insert(pattern)
+        return GovernanceState(
+            id: id,
+            writablePaths: writablePaths,
+            protectedPatterns: patterns,
+            budget: budget
+        )
+    }
+
+    /// Returns a new GovernanceState with a removed protected pattern.
+    public func removingProtectedPattern(_ pattern: String) -> GovernanceState {
+        var patterns = protectedPatterns
+        patterns.remove(pattern)
+        return GovernanceState(
+            id: id,
+            writablePaths: writablePaths,
+            protectedPatterns: patterns,
+            budget: budget
+        )
     }
 }

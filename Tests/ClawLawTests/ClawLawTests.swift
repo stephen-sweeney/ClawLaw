@@ -4,639 +4,196 @@
 //
 //  Created by Stephen Sweeney on 2/4/26.
 //
+//  PHASE 1: Minimal type-level tests to verify SwiftVector integration.
+//  Full governance tests will be rewritten in Phase 6 after Laws,
+//  Reducer, and Orchestrator are implemented (Phases 2-5).
+//
+//  The original 17 governance tests are preserved in git history.
+//
 
 import Testing
+import Foundation
+import SwiftVectorCore
 @testable import ClawLawCore
 
-@Suite("ClawLaw Governance Tests")
-struct ClawLawTests {
-    
-    // MARK: - Experiment 1: Normal Operation
-    
-    @Test("Experiment 1: Normal Operation")
-    func normalOperation() async throws {
-        // Setup: 10,000 token budget, organize documents (low cost)
-        let initialState = GovernanceState.mock(taskCeiling: 10000)
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Action: Agent proposes organizing documents (500 tokens)
-        let action = AgentAction.research(estimatedTokens: 500)
-        let result = await orchestrator.propose(action)
-        
-        // Assert: Action allowed, remains in Normal tier
-        #expect(result.isAllowed, "Normal operation should be allowed")
-        
-        let state = await orchestrator.currentState()
-        #expect(state.budget.currentSpend == 500, "Budget should reflect token spend")
-        #expect(state.budget.enforcement == .normal, "Should remain in normal enforcement")
-        
-        print("✅ Experiment 1: Normal operation - \(result.message)")
-    }
-    
-    // MARK: - Experiment 2: Approaching Limit (Warning State)
-    
-    @Test("Experiment 2: Approaching Limit (Warning State)")
-    func approachingLimit() async throws {
-        // Setup: Simulate spending up to 80% threshold
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 7800  // 78% utilized
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Action: Detailed documentation (200 tokens) pushes over 80% threshold
-        let action = AgentAction.research(estimatedTokens: 200)
-        let result = await orchestrator.propose(action)
-        
-        // Assert: Warning state triggered, agent notified, continues
-        switch result {
-        case .allowedWithWarning(let message):
-            #expect(message.contains("WARNING"), "Should emit warning message")
-            print("✅ Experiment 2: Warning triggered - \(message)")
-        default:
-            Issue.record("Expected allowedWithWarning, got \(result)")
-        }
-        
-        let state = await orchestrator.currentState()
-        #expect(state.budget.currentSpend == 8000, "Budget should be 8000")
-        #expect(state.budget.enforcement == .degraded, "Should be in degraded enforcement")
-    }
-    
-    // MARK: - Experiment 3: Exceeding Threshold (Critical → Suspended)
-    
-    @Test("Experiment 3a: Exceeding Threshold - Critical (Gated Mode)")
-    func exceedingThresholdCritical() async throws {
-        // Setup: Simulate spending to 94%
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9400  // 94% utilized
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Action: Refactor request (600 tokens) pushes to 10000 = 100% exactly (gated threshold)
-        let action = AgentAction.research(estimatedTokens: 600)
-        let result = await orchestrator.propose(action)
-        
-        // Assert: Critical state → gated mode transition at exactly 100%
-        switch result {
-        case .allowedWithWarning(let message):
-            #expect(message.contains("CRITICAL"), "Should emit critical warning")
-            print("✅ Experiment 3a: Critical threshold - \(message)")
-        default:
-            Issue.record("Expected allowedWithWarning with CRITICAL, got \(result)")
-        }
-        
-        let state = await orchestrator.currentState()
-        #expect(state.budget.enforcement == .gated, "Should be in gated enforcement at 100%")
-        #expect(state.budget.currentSpend == 10000, "Budget should be exactly 10000 (100%)")
+@Suite("ClawLaw Phase 1 — Type Integration Tests")
+struct ClawLawTypeTests {
+
+    // MARK: - GovernanceState conforms to State
+
+    @Test("GovernanceState conforms to SwiftVector State protocol")
+    func governanceStateConformsToState() {
+        let state = GovernanceState.mock()
+
+        // State requires stateHash() — provided by default implementation
+        let hash = state.stateHash()
+        #expect(!hash.isEmpty, "State hash should be non-empty")
+        #expect(hash.count == 64, "SHA256 hash should be 64 hex characters")
+
+        // Determinism: same state → same hash
+        let hash2 = state.stateHash()
+        #expect(hash == hash2, "Same state must produce same hash")
     }
 
-    @Test("Experiment 3b: Exceeding threshold transitions to halted state")
-    func exceedingThresholdHalted() async throws {
-        // Start at 99% (9900 tokens) - in gated range, requires approval workflow
-        // This matches EXPERIMENTS.md Part B specification
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9900  // 99% - will be reconciled to .gated
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Verify we're in gated mode due to reconciliation
-        var state = await orchestrator.currentState()
-        #expect(state.budget.enforcement == .gated, "Should be gated at 99%")
-        
-        // Action that pushes over 100% (9900 + 200 = 10100) requires approval in gated mode
-        let action = AgentAction.research(estimatedTokens: 200)
-        let result = await orchestrator.propose(action)
-        
-        // Should be suspended for approval
-        guard case .suspended(let approvalId, let message) = result else {
-            Issue.record("Expected suspension in gated mode, got \(result)")
-            return
-        }
-        
-        #expect(message.contains("99%") || message.contains("gat"), "Message should reference gated mode")
-        print("✅ Experiment 3b: Action suspended in gated mode at 99%")
-        
-        // Approve to push to halted
-        let approvalResult = await orchestrator.approve(actionId: approvalId)
-        print("Approval result: \(approvalResult)")
-        
-        state = await orchestrator.currentState()
-        #expect(state.budget.currentSpend == 10100, "Spend should be recorded (9900 + 200)")
-        #expect(state.budget.enforcement == .halted, "State should be halted after approval")
-        
-        print("✅ Experiment 3b: System transitioned to halted via approval, spend recorded")
-        
-        // Verify subsequent actions are blocked by gate check
-        let nextAction = AgentAction.research(estimatedTokens: 10)
-        let nextResult = await orchestrator.propose(nextAction)
-        
-        guard case .rejected(let reason) = nextResult else {
-            Issue.record("Expected rejection from gate check, got \(nextResult)")
-            return
-        }
-        #expect(reason.contains("halted"), "Should indicate system is halted")
-        print("✅ Experiment 3b: Subsequent actions blocked in halted state")
-    }
-    
-    @Test("Experiment 3c: Reaching Halted State via Transition")
-    func reachingHaltedStateViaTransition() async throws {
-        // Setup: Start at exactly 95% (gated threshold)
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9500  // 95% - at gated threshold
-        initialState.budget.enforcement = .gated  // Already in gated mode
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // In gated mode, actions require approval first
-        // But let's say we got approval and now execute an action that reaches 100%
-        // For testing purposes, we can push state to halted by doing a steward operation
-        
-        // Actually, let's test: if we're at 95% (gated), what happens with a 500 token action?
-        // It would be 9500 + 500 = 10000 = 100% = halted
-        // But since we're in gated mode, it requires approval first
-        
-        let action = AgentAction.research(estimatedTokens: 500)
-        let result = await orchestrator.propose(action)
-        
-        // In gated mode, non-zero cost actions require approval
-        switch result {
-        case .suspended(_, let message):
-            #expect(message.contains("Critical budget threshold"), "Should require approval in gated mode")
-            print("✅ Experiment 3c: Gated mode requires approval - \(message)")
-        default:
-            Issue.record("Expected suspension for approval in gated mode, got \(result)")
-        }
-    }
-    
-    @Test("Experiment 3d: Halted State Blocks All Actions")
-    func haltedStateBlocksAllActions() async throws {
-        // Setup: System already in halted state
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 10000  // Exactly at budget
-        initialState.budget.enforcement = .halted
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Action: Any action while halted
-        let action = AgentAction.research(estimatedTokens: 10)
-        let result = await orchestrator.propose(action)
-        
-        // Assert: All actions blocked in halted state
-        switch result {
-        case .rejected(let reason):
-            #expect(reason.contains("halted"), "Should indicate halted state")
-            print("✅ Experiment 3d: Halted blocks all actions - \(reason)")
-        default:
-            Issue.record("Expected rejection, got \(result)")
-        }
-    }
-    
-    // MARK: - Experiment 4: Recovery (Human Intervention)
-    
-    @Test("Experiment 4a: Recovery - Increase Budget")
-    func recoveryIncreaseBudget() async throws {
-        // Setup: System in degraded state
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 8500  // 85% utilized
-        initialState.budget.enforcement = .degraded
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Human increases budget
-        let newState = await orchestrator.increaseBudget(to: 20000)
-        
-        // Assert: State transitions back to Normal
-        #expect(newState.budget.taskCeiling == 20000, "Ceiling should be increased")
-        #expect(newState.budget.currentSpend == 8500, "Spend unchanged")
-        
-        // 8500/20000 = 42.5%, should be back to normal
-        #expect(newState.budget.enforcement == .normal, "Should transition to normal")
-        
-        // Verify audit trail
-        let auditTrail = await orchestrator.recentAuditEntries(limit: 100)
-        let lastEntry = try #require(auditTrail.last, "Should have audit entry")
-        #expect(lastEntry.action.contains("STEWARD_INTERVENTION"), "Should log intervention")
-        
-        print("✅ Experiment 4a: Budget increased, state recovered to normal")
-        
-        // Now agent can resume normal operation
-        let action = AgentAction.research(estimatedTokens: 500)
-        let result = await orchestrator.propose(action)
-        #expect(result.isAllowed, "Actions should be allowed after recovery")
-        
-        print("✅ Experiment 4b: Agent resumes normal operation after recovery")
-    }
-    
-    @Test("Experiment 4c: Recovery - Reset Budget")
-    func recoveryResetBudget() async throws {
-        // Setup: System in halted state
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 10500
-        initialState.budget.enforcement = .halted
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Human resets budget
-        let newState = await orchestrator.resetBudget()
-        
-        // Assert: Spend reset, state back to normal
-        #expect(newState.budget.currentSpend == 0, "Spend should be reset")
-        #expect(newState.budget.enforcement == .normal, "Should be normal")
-        
-        print("✅ Experiment 4c: Budget reset, system recovered from halt")
-    }
-    
-    // MARK: - Experiment 5: Gaming Attempt
-    
-    @Test("Experiment 5a: Gaming Attempt - Reducer Does Not Negotiate")
-    func gamingAttemptReducerDoesNotNegotiate() async throws {
-        // Setup: System at gated threshold (95%)
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 9500  // 95% - at gated threshold
-        initialState.budget.enforcement = .gated
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Action: Agent tries to bypass approval with "urgent" justification
-        // The reducer doesn't see the justification - only the token cost
-        let action = AgentAction.research(estimatedTokens: 600)
-        let result = await orchestrator.propose(action)
-        
-        // Assert: In gated mode, all actions require approval - no exceptions
-        switch result {
-        case .suspended(let approvalId, let message):
-            #expect(message.contains("Critical budget threshold") || message.contains("Approve to continue"),
-                   "Should require approval in gated mode")
-            print("✅ Experiment 5a: Gaming attempt blocked - requires approval")
-            print("   Approval ID: \(approvalId)")
-            print("   Message: \(message)")
-            
-            // Verify suspension was logged to audit trail
-            let audit = await orchestrator.recentAuditEntries(limit: 5)
-            let hasSuspension = audit.contains { $0.action.contains("SUSPENDED") }
-            #expect(hasSuspension, "Suspension should be logged to audit trail")
-            
-        default:
-            Issue.record("Expected suspension in gated mode, got \(result)")
-        }
-        
-        // Verify budget unchanged (action not executed)
-        let state = await orchestrator.currentState()
-        #expect(state.budget.currentSpend == 9500, "Budget should be unchanged")
-        #expect(state.budget.enforcement == .gated, "Should remain in gated mode")
-        
-        print("✅ Experiment 5a: Reducer enforces approval requirement deterministically")
-    }
-    
-    @Test("Experiment 5b: Gaming Attempt - State Transitions Proceed")
-    func gamingAttemptStateTransitionsProceed() async throws {
-        // Setup: Multiple actions pushing through enforcement levels
-        var initialState = GovernanceState.mock(taskCeiling: 10000)
-        initialState.budget.currentSpend = 7900  // 79% - just under warning threshold
-        
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // Sequence of actions that push through enforcement levels
-        // Note: Once in gated mode, actions require approval
-        
-        // Action 1: Push to degraded (7900 + 200 = 8100 = 81%)
-        var result = await orchestrator.propose(.research(estimatedTokens: 200))
-        var state = await orchestrator.currentState()
-        print("Action 1: spend=\(state.budget.currentSpend), level=\(state.budget.enforcement)")
-        #expect(state.budget.currentSpend == 8100, "Should be 8100")
-        #expect(state.budget.enforcement == .degraded, "Should be degraded")
-        
-        // Action 2: Push to gated (8100 + 1400 = 9500 = 95%)
-        result = await orchestrator.propose(.research(estimatedTokens: 1400))
-        state = await orchestrator.currentState()
-        print("Action 2: spend=\(state.budget.currentSpend), level=\(state.budget.enforcement)")
-        #expect(state.budget.currentSpend == 9500, "Should be 9500")
-        #expect(state.budget.enforcement == .gated, "Should be gated")
-        
-        // Action 3: Try to push to halted (9500 + 600 = 10100)
-        // But in gated mode, this requires approval FIRST
-        result = await orchestrator.propose(.research(estimatedTokens: 600))
-        state = await orchestrator.currentState()
-        print("Action 3: result=\(result.message), spend=\(state.budget.currentSpend), level=\(state.budget.enforcement)")
-        
-        // Should be suspended for approval, not executed
-        switch result {
-        case .suspended(let approvalId, _):
-            print("✅ Action suspended for approval in gated mode")
-            
-            // Now approve it to push to halted
-            let approvalResult = await orchestrator.approve(actionId: approvalId)
-            print("Approval result: \(approvalResult)")
-            
-            // After approval and execution, should be halted
-            let finalState = await orchestrator.currentState()
-            #expect(finalState.budget.currentSpend == 10100, "Final spend should be 10100")
-            #expect(finalState.budget.enforcement == .halted, "Should reach halted after approval")
-            
-        default:
-            Issue.record("Expected suspension in gated mode, got \(result)")
-        }
-        
-        print("✅ Experiment 5b: State transitions proceeded through approval workflow")
-    }
-    
-    // MARK: - Additional Tests: Filesystem Boundaries (Law 0)
-    
-    @Test("Filesystem Boundary: Allowed Path")
-    func filesystemBoundaryAllowedPath() async throws {
-        let initialState = GovernanceState.mock(
-            writablePaths: ["/workspace"],
-            taskCeiling: 10000
-        )
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        let action = AgentAction.writeFile(path: "/workspace/test.txt", content: "data")
-        let result = await orchestrator.propose(action)
-        
-        #expect(result.isAllowed, "Should allow write to workspace")
-        print("✅ Filesystem boundary: Allowed path succeeded")
-    }
-    
-    @Test("Filesystem Boundary: Denied Path")
-    func filesystemBoundaryDeniedPath() async throws {
-        let initialState = GovernanceState.mock(
-            writablePaths: ["/workspace"],
-            taskCeiling: 10000
-        )
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        let action = AgentAction.writeFile(path: "/etc/passwd", content: "malicious")
-        let result = await orchestrator.propose(action)
-        
-        switch result {
-        case .rejected(let reason):
-            #expect(reason.contains("outside authorized workspace"), 
-                   "Should reject with boundary violation")
-            print("✅ Filesystem boundary: Denied path blocked - \(reason)")
-        default:
-            Issue.record("Expected rejection, got \(result)")
-        }
-    }
-    
-    @Test("Filesystem Boundary: Protected Pattern")
-    func filesystemBoundaryProtectedPattern() async throws {
-        let initialState = GovernanceState.mock(
-            writablePaths: ["/workspace"],
+    @Test("GovernanceState Codable round-trip preserves all fields")
+    func governanceStateCodable() throws {
+        let state = GovernanceState.mock(
+            writablePaths: ["/workspace", "/tmp"],
             protectedPatterns: [".ssh", "credentials"],
-            taskCeiling: 10000
+            taskCeiling: 5000
         )
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        let action = AgentAction.writeFile(path: "/workspace/.ssh/id_rsa", content: "keys")
-        let result = await orchestrator.propose(action)
-        
-        switch result {
-        case .suspended(_, let message):
-            #expect(message.contains("protected file pattern"), 
-                   "Should require approval for protected patterns")
-            print("✅ Filesystem boundary: Protected pattern requires approval - \(message)")
-        default:
-            Issue.record("Expected suspension for approval, got \(result)")
-        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(state)
+
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(GovernanceState.self, from: data)
+
+        #expect(decoded == state, "Codable round-trip should preserve equality")
+        #expect(decoded.id == state.id)
+        #expect(decoded.writablePaths == state.writablePaths)
+        #expect(decoded.protectedPatterns == state.protectedPatterns)
+        #expect(decoded.budget == state.budget)
     }
-    
-    // MARK: - Additional Tests: Approval Queue (Law 8)
-    
-    @Test("Approval Queue: High-Risk Action")
-    func approvalQueueHighRiskAction() async throws {
-        let initialState = GovernanceState.mock(taskCeiling: 10000)
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // High-risk action: send email
-        let action = AgentAction.sendEmail(to: "user@example.com", subject: "Test", body: "Hello")
-        let result = await orchestrator.propose(action)
-        
-        // Assert: Action suspended for approval
-        guard case .suspended(let approvalId, _) = result else {
-            Issue.record("Expected suspended, got \(result)")
-            return
-        }
-        
-        print("✅ High-risk action suspended with ID: \(approvalId)")
-        
-        // Verify it's in the queue
-        let pending = await orchestrator.pendingApprovals()
-        #expect(pending.count == 1, "Should have 1 pending approval")
-        #expect(pending[0].id == approvalId, "IDs should match")
-        
-        print("✅ Approval queue: High-risk action properly queued")
-        
-        // Note: Approving the action would run it through the reducer again,
-        // which would require approval again (sendEmail always requires approval).
-        // This is a known limitation - the reducer doesn't know the action was already approved.
-        // In a real system, you'd need to mark the action as "pre-approved" or
-        // execute it differently. For now, we test that it can be rejected:
-        
-        await orchestrator.reject(actionId: approvalId, reason: "Test completed")
-        let pendingAfterReject = await orchestrator.pendingApprovals()
-        #expect(pendingAfterReject.count == 0, "Queue should be empty after rejection")
-        
-        print("✅ Approval queue: Action successfully rejected and removed from queue")
+
+    @Test("GovernanceState is immutable — updates produce new instances")
+    func governanceStateImmutability() {
+        let state = GovernanceState.mock(taskCeiling: 10000)
+        let updated = state.withBudget(state.budget.withSpend(5000))
+
+        #expect(state.budget.currentSpend == 0, "Original should be unchanged")
+        #expect(updated.budget.currentSpend == 5000, "Updated should have new spend")
+        #expect(state.id == updated.id, "ID should be preserved")
     }
-    
-    // MARK: - Integration Test: Complete Workflow
-    
-    @Test("Complete Workflow Integration Test")
-    func completeWorkflow() async throws {
-        print("\n=== Running Complete Workflow Integration Test ===\n")
-        
-        let initialState = GovernanceState.mock(
-            writablePaths: ["/workspace"],
-            protectedPatterns: [".ssh"],
-            taskCeiling: 10000
-        )
-        let orchestrator = GovernanceOrchestrator(initialState: initialState)
-        
-        // 1. Normal operation
-        var result = await orchestrator.propose(.research(estimatedTokens: 2000))
-        print("1. Normal research: \(result.message)")
-        #expect(result.isAllowed)
-        
-        // 2. File write (allowed)
-        result = await orchestrator.propose(.writeFile(path: "/workspace/doc.txt", content: "data"))
-        print("2. File write: \(result.message)")
-        #expect(result.isAllowed)
-        
-        // 3. Protected file (requires approval)
-        result = await orchestrator.propose(.writeFile(path: "/workspace/.ssh/key", content: "secret"))
-        print("3. Protected file: \(result.message)")
-        guard case .suspended(let approvalId, _) = result else {
-            Issue.record("Expected suspension")
-            return
-        }
-        
-        // Human rejects
-        await orchestrator.reject(actionId: approvalId, reason: "Dangerous operation")
-        print("3. Steward rejected protected file write")
-        
-        // 4. More research pushing toward budget limit (currently at 2100, add 5400 = 7500 = 75%)
-        result = await orchestrator.propose(.research(estimatedTokens: 5400))
-        print("4. Heavy research: \(result.message)")
-        #expect(result.isAllowed)
-        
-        // 5. Push into degraded zone (7500 + 1000 = 8500 = 85%)
-        result = await orchestrator.propose(.research(estimatedTokens: 1000))
-        print("5. Degraded zone: \(result.message)")
-        // Should be allowed with warning (degraded threshold crossed)
-        switch result {
-        case .allowedWithWarning(let message):
-            #expect(message.contains("WARNING"), "Should emit degraded warning")
-        case .allowed:
-            break // Might still be normal if threshold not hit
-        default:
-            Issue.record("Expected allowed or allowedWithWarning, got \(result)")
-        }
-        
-        // 6. Push into gated zone (8500 + 1000 = 9500 = 95%)
-        result = await orchestrator.propose(.research(estimatedTokens: 1000))
-        print("6. Gated zone: \(result.message)")
-        
-        var state = await orchestrator.currentState()
-        print("6. Current state: \(state.budget.currentSpend)/\(state.budget.taskCeiling), enforcement: \(state.budget.enforcement)")
-        #expect(state.budget.enforcement == .gated, "Should be in gated mode at 95%")
-        
-        // 7. Try to push to halted (9500 + 600 = 10100 = 101%)
-        // In gated mode, this will require approval
-        result = await orchestrator.propose(.research(estimatedTokens: 600))
-        print("7. Attempt to push to halted: \(result.message)")
-        
-        // Should be suspended for approval
-        guard case .suspended(let haltApprovalId, _) = result else {
-            Issue.record("Expected suspension in gated mode, got \(result)")
-            return
-        }
-        
-        print("7. Action suspended for approval (gated mode)")
-        
-        // 8. Approve the action to push to halted
-        let approvalResult = await orchestrator.approve(actionId: haltApprovalId)
-        print("8. Approved action: \(approvalResult)")
-        
-        state = await orchestrator.currentState()
-        print("8. After approval - spend: \(state.budget.currentSpend), enforcement: \(state.budget.enforcement)")
-        
-        // System should now be halted (spend was applied during approved execution)
-        #expect(state.budget.enforcement == .halted, "Should have transitioned to halted")
-        #expect(state.budget.currentSpend == 10100, "Spend should be 10100")
-        print("8. System is halted at \(state.budget.currentSpend)/\(state.budget.taskCeiling)")
-        
-        // 9. Human recovers by resetting (even though we're not technically halted, reset works)
-        let _ = await orchestrator.resetBudget()
-        print("9. Steward reset budget - system recovered")
-        
-        // 10. Normal operation resumes
-        result = await orchestrator.propose(.research(estimatedTokens: 500))
-        print("10. Post-recovery: \(result.message)")
-        #expect(result.isAllowed)
-        
-        // 11. Review audit trail
-        let audit = await orchestrator.recentAuditEntries(limit: 100)
-        print("\n=== Audit Trail (\(audit.count) entries) ===")
-        for (i, entry) in audit.prefix(10).enumerated() {
-            print("\(i + 1). [\(entry.enforcement.rawValue)] \(entry.action)")
-        }
-        
-        // 12. Statistics
-        let stats = await orchestrator.statistics()
-        print("\n=== Final Statistics ===")
-        print(stats.description)
-        
-        print("\n✅ Complete workflow test passed\n")
-    }
-    
-    // MARK: - Enforcement Reconciliation Tests
-    
-    @Test("Enforcement reconciliation cannot be bypassed by property order")
-    func enforcementReconciliationOrderIndependence() async throws {
-        // Test Pattern 1: Set currentSpend first, then try to downgrade enforcement
-        var budget1 = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .normal)
-        budget1.currentSpend = 9500  // 95% → should auto-upgrade to .gated
-        #expect(budget1.enforcement == .gated, "Setting spend to 95% should auto-upgrade to gated")
-        
-        budget1.enforcement = .degraded  // Attempt to downgrade
-        #expect(budget1.enforcement == .gated, "Cannot downgrade from .gated to .degraded when spend is 95%")
-        
-        budget1.enforcement = .normal  // Attempt to downgrade further
-        #expect(budget1.enforcement == .gated, "Cannot downgrade from .gated to .normal when spend is 95%")
-        
-        print("✅ Pattern 1: Reconciliation prevents downgrade after spend update")
-        
-        // Test Pattern 2: Set enforcement first, then set high spend
-        var budget2 = BudgetState(taskCeiling: 10000, currentSpend: 0, enforcement: .degraded)
-        #expect(budget2.enforcement == .degraded, "Initial enforcement should be .degraded")
-        
-        budget2.currentSpend = 9500  // 95% → should auto-upgrade to .gated
-        #expect(budget2.enforcement == .gated, "Setting spend to 95% should upgrade .degraded to .gated")
-        
-        print("✅ Pattern 2: Reconciliation upgrades enforcement when spend increases")
-        
-        // Test Pattern 3: Simultaneous updates (simulating state mutation in tests)
-        var budget3 = GovernanceState.mock(taskCeiling: 10000).budget
-        budget3.currentSpend = 9900  // 99% → .gated
-        budget3.enforcement = .normal  // Attempt bypass
-        
-        // Should reconcile to .gated because spend is 99%
-        #expect(budget3.enforcement == .gated, "Cannot bypass gating with stale enforcement value")
-        
-        print("✅ Pattern 3: Cannot bypass gating with stale enforcement value")
-        
-        // Test Pattern 4: Verify init() reconciliation
-        let budget4 = BudgetState(
+
+    // MARK: - BudgetState enforcement reconciliation
+
+    @Test("BudgetState init reconciles enforcement level")
+    func budgetStateReconciliation() {
+        // Stale enforcement (normal) with 95% spend → should reconcile to gated
+        let budget = BudgetState(
             taskCeiling: 10000,
-            currentSpend: 9500,  // 95%
-            enforcement: .normal  // Stale/incorrect value
+            currentSpend: 9500,
+            enforcement: .normal
         )
-        #expect(budget4.enforcement == .gated, "Init should reconcile stale enforcement to .gated")
-        
-        print("✅ Pattern 4: Init reconciliation prevents stale enforcement")
-        
-        // Test Pattern 5: Halted state cannot be downgraded
-        var budget5 = BudgetState(taskCeiling: 10000, currentSpend: 10500, enforcement: .halted)
-        #expect(budget5.enforcement == .halted, "Should start in halted state")
-        
-        budget5.enforcement = .normal
-        #expect(budget5.enforcement == .halted, "Cannot downgrade from halted when over budget")
-        
-        budget5.enforcement = .gated
-        #expect(budget5.enforcement == .halted, "Cannot downgrade from halted to gated when over budget")
-        
-        print("✅ Pattern 5: Halted state cannot be downgraded")
-        
-        print("\n✅ All enforcement reconciliation tests passed - no bypass possible\n")
+        #expect(budget.enforcement == .gated, "Init should reconcile stale enforcement")
+
+        // Over budget → halted
+        let overBudget = BudgetState(
+            taskCeiling: 10000,
+            currentSpend: 10500,
+            enforcement: .normal
+        )
+        #expect(overBudget.enforcement == .halted, "Over budget should be halted")
+
+        // Normal spend → stays normal
+        let normalBudget = BudgetState(
+            taskCeiling: 10000,
+            currentSpend: 5000,
+            enforcement: .normal
+        )
+        #expect(normalBudget.enforcement == .normal, "50% spend should stay normal")
     }
-    
-    @Test("Enforcement reconciliation in orchestrator state mutations")
-    func enforcementReconciliationInOrchestrator() async throws {
-        // This tests that even if we try to manipulate state through the orchestrator,
-        // reconciliation prevents bypassing gating
-        
-        var state = GovernanceState.mock(taskCeiling: 10000)
-        state.budget.currentSpend = 9500  // 95% → .gated
-        state.budget.enforcement = .normal  // Attempt to bypass
-        
-        // State should be reconciled to .gated
-        #expect(state.budget.enforcement == .gated, "State reconciliation should prevent bypass")
-        
-        let orchestrator = GovernanceOrchestrator(initialState: state)
-        let currentState = await orchestrator.currentState()
-        
-        #expect(currentState.budget.enforcement == .gated, "Orchestrator should preserve reconciled state")
-        #expect(currentState.budget.currentSpend == 9500, "Spend should be 9500")
-        
-        // Verify that gated mode is actually enforced (action requires approval)
-        let result = await orchestrator.propose(.research(estimatedTokens: 100))
-        
-        guard case .suspended(_, let message) = result else {
-            Issue.record("Expected suspension in gated mode, got \(result)")
-            return
+
+    @Test("BudgetState.withSpend preserves reconciliation guarantee")
+    func budgetStateWithSpend() {
+        let budget = BudgetState(taskCeiling: 10000)
+        let updated = budget.withSpend(9500)
+
+        #expect(updated.enforcement == .gated, "95% spend should trigger gated")
+        #expect(updated.currentSpend == 9500)
+        #expect(updated.taskCeiling == 10000, "Ceiling unchanged")
+    }
+
+    @Test("BudgetState Codable round-trip with reconciliation")
+    func budgetStateCodable() throws {
+        let budget = BudgetState(
+            taskCeiling: 10000,
+            currentSpend: 8500,
+            enforcement: .degraded,
+            warningThreshold: 0.80,
+            criticalThreshold: 0.95
+        )
+
+        let data = try JSONEncoder().encode(budget)
+        let decoded = try JSONDecoder().decode(BudgetState.self, from: data)
+
+        #expect(decoded == budget, "Codable round-trip should preserve equality")
+        #expect(decoded.enforcement == .degraded)
+    }
+
+    // MARK: - GovernanceAction conforms to Action
+
+    @Test("GovernanceAction provides correlationID and actionDescription")
+    func governanceActionProtocol() {
+        let id = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
+        let action = GovernanceAction.research(id: id, estimatedTokens: 500)
+
+        #expect(action.correlationID == id)
+        #expect(action.actionDescription.contains("500"))
+        #expect(action.tokenCost == 500)
+        #expect(action.authorizationLevel == .readOnly)
+    }
+
+    @Test("GovernanceAction Codable round-trip")
+    func governanceActionCodable() throws {
+        let id = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
+        let actions: [GovernanceAction] = [
+            .research(id: id, estimatedTokens: 500),
+            .writeFile(id: id, path: "/workspace/test.txt", content: "data"),
+            .deleteFile(id: id, path: "/workspace/old.txt"),
+            .sendEmail(id: id, to: "user@example.com", subject: "Test", body: "Hello"),
+            .executeShellCommand(id: id, command: "ls"),
+            .increaseBudget(id: id, newCeiling: 20000),
+            .resetBudget(id: id),
+        ]
+
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        for action in actions {
+            let data = try encoder.encode(action)
+            let decoded = try decoder.decode(GovernanceAction.self, from: data)
+            #expect(decoded == action, "Codable round-trip failed for \(action.actionDescription)")
         }
-        
-        #expect(message.contains("gat") || message.contains("95%"), "Should indicate gated mode")
-        
-        print("✅ Orchestrator enforces reconciled gated state - no bypass possible")
+    }
+
+    @Test("GovernanceAction steward actions have zero token cost")
+    func stewardActionsCost() {
+        let id = UUID()
+        #expect(GovernanceAction.increaseBudget(id: id, newCeiling: 20000).tokenCost == 0)
+        #expect(GovernanceAction.resetBudget(id: id).tokenCost == 0)
+        #expect(GovernanceAction.approveAction(id: id, approvalId: UUID()).tokenCost == 0)
+        #expect(GovernanceAction.rejectAction(id: id, approvalId: UUID(), reason: "no").tokenCost == 0)
+    }
+
+    @Test("GovernanceAction isStewardAction distinguishes agent vs steward")
+    func stewardActionFlag() {
+        let id = UUID()
+        #expect(!GovernanceAction.research(id: id, estimatedTokens: 500).isStewardAction)
+        #expect(!GovernanceAction.writeFile(id: id, path: "/workspace/f", content: "x").isStewardAction)
+        #expect(GovernanceAction.increaseBudget(id: id, newCeiling: 20000).isStewardAction)
+        #expect(GovernanceAction.resetBudget(id: id).isStewardAction)
+        #expect(GovernanceAction.approveAction(id: id, approvalId: UUID()).isStewardAction)
+    }
+
+    // MARK: - Path utilities
+
+    @Test("GovernanceState path checks work correctly")
+    func pathChecks() {
+        let state = GovernanceState.mock(
+            writablePaths: ["/workspace", "/tmp"],
+            protectedPatterns: [".ssh", "credentials"]
+        )
+
+        #expect(state.isPathAllowed("/workspace/test.txt"))
+        #expect(state.isPathAllowed("/tmp/scratch"))
+        #expect(!state.isPathAllowed("/etc/passwd"))
+        #expect(!state.isPathAllowed("/home/user/file.txt"))
+
+        #expect(state.isPathProtected("/workspace/.ssh/id_rsa"))
+        #expect(state.isPathProtected("/workspace/credentials.json"))
+        #expect(!state.isPathProtected("/workspace/readme.md"))
     }
 }

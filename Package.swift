@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "ClawLaw",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v16)
+        .macOS(.v14),
+        .iOS(.v17)
     ],
     products: [
         // The ClawLaw CLI executable
@@ -24,14 +24,18 @@ let package = Package(
     dependencies: [
         // ArgumentParser for CLI
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
+        // SwiftVector governance framework
+        .package(path: "../SwiftVector"),
     ],
     targets: [
         // The core governance library
         .target(
             name: "ClawLawCore",
-            dependencies: []
+            dependencies: [
+                .product(name: "SwiftVectorCore", package: "SwiftVector"),
+            ]
         ),
-        
+
         // The CLI executable
         .executableTarget(
             name: "ClawLaw",
@@ -40,11 +44,15 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
-        
+
         // Tests
         .testTarget(
             name: "ClawLawTests",
-            dependencies: ["ClawLawCore"]
+            dependencies: [
+                "ClawLawCore",
+                .product(name: "SwiftVectorCore", package: "SwiftVector"),
+                .product(name: "SwiftVectorTesting", package: "SwiftVector"),
+            ]
         ),
     ]
 )
