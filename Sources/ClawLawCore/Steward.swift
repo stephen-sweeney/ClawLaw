@@ -4,37 +4,68 @@
 //
 //  Created by Stephen Sweeney on 2/4/26.
 //
-//  PHASE 1 STUB: The Steward will be refactored to a thin wrapper
-//  dispatching GovernanceAction cases through the orchestrator in Phase 5.
-//
-//  The original Steward logic is preserved in git history.
+//  Thin wrapper dispatching GovernanceAction steward interventions
+//  through the ClawLawOrchestrator. The Steward is the human-facing
+//  interface for budget management and approval queue resolution.
 //
 
 import Foundation
 import SwiftVectorCore
 
-/// Placeholder Steward for Phase 1 compilation.
-/// Phase 5 will refactor this to dispatch GovernanceAction cases
-/// through the ClawLawOrchestrator.
 public actor Steward {
 
-    private var state: GovernanceState
-    private let approvalQueue: ApprovalQueue
+    public let orchestrator: ClawLawOrchestrator
+    private let uuidGenerator: any UUIDGenerator
 
     public init(
         initialState: GovernanceState,
         clock: any Clock,
         uuidGenerator: any UUIDGenerator
     ) {
-        self.state = initialState
-        self.approvalQueue = ApprovalQueue(clock: clock, uuidGenerator: uuidGenerator)
+        self.orchestrator = ClawLawOrchestrator(
+            initialState: initialState,
+            clock: clock,
+            uuidGenerator: uuidGenerator
+        )
+        self.uuidGenerator = uuidGenerator
     }
 
-    public func currentState() -> GovernanceState {
-        return state
+    // MARK: - Budget Management
+
+    public func increaseBudget(to newCeiling: Int) async {
+        let id = uuidGenerator.next()
+        let _ = await orchestrator.propose(
+            .increaseBudget(id: id, newCeiling: newCeiling),
+            agentID: "steward"
+        )
     }
 
-    public func budgetStatus() -> BudgetStatus {
+    public func resetBudget() async {
+        let id = uuidGenerator.next()
+        let _ = await orchestrator.propose(
+            .resetBudget(id: id),
+            agentID: "steward"
+        )
+    }
+
+    // MARK: - Approval Queue
+
+    public func approve(id: UUID) async -> Bool {
+        await orchestrator.approveEscalated(id: id)
+    }
+
+    public func reject(id: UUID, reason: String) async {
+        await orchestrator.rejectEscalated(id: id, reason: reason)
+    }
+
+    public func pendingApprovals() async -> [ApprovalQueue.PendingAction] {
+        await orchestrator.pendingApprovals()
+    }
+
+    // MARK: - Status
+
+    public func budgetStatus() async -> BudgetStatus {
+        let state = await orchestrator.currentState
         return BudgetStatus(
             ceiling: state.budget.taskCeiling,
             spent: state.budget.currentSpend,
@@ -52,7 +83,7 @@ public actor Steward {
         public let enforcement: BudgetState.EnforcementLevel
 
         public var description: String {
-            return """
+            """
             Budget: \(spent)/\(ceiling) tokens (\(utilizationPercent)%)
             Remaining: \(remaining) tokens
             Enforcement: \(enforcement.rawValue)
