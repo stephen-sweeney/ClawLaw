@@ -119,6 +119,17 @@ public enum GovernanceAction: Action {
         }
     }
 
+    /// The filesystem path targeted by this action, if any.
+    /// Used by SandboxBoundaryLaw and ProtectedPatternLaw.
+    public var targetPath: String? {
+        switch self {
+        case .writeFile(_, let path, _), .deleteFile(_, let path):
+            return path
+        default:
+            return nil
+        }
+    }
+
     /// Whether this is a steward intervention (bypasses governance gating).
     public var isStewardAction: Bool {
         switch self {
